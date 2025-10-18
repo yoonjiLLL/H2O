@@ -7,6 +7,7 @@ import queue
 import shutil
 import time
 import threading
+import logging
 from typing import Optional, Union, Tuple
 
 # import cupy as cp
@@ -18,6 +19,110 @@ import numpy as np
 from flexgen.utils import (GB, T, cpu_mem_stats, vector_gather,
     np_dtype_to_torch_dtype, torch_dtype_to_np_dtype,
     torch_dtype_to_num_bytes)
+
+# Configure logging
+def setup_logger(log_file='h2o_flexgen_log.txt'):
+    """Setup logger to save logs to file"""
+    logger = logging.getLogger('h2o_flexgen')
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicate logs
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    
+    # Create console handler (optional - for also seeing logs in console)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+def set_log_file(log_file):
+    """Change the log file path"""
+    global logger
+    logger = setup_logger(log_file)
+    logger.info(f"Logging redirected to: {log_file}")
+
+# Initialize logger
+logger = setup_logger()
+
+# Global variables for token analysis
+token_analysis_data = {
+    'step': 0,
+    'hh_all_data': {},  # Store hh_all attention data
+    'hh_ratio_data': {},  # Store hh_ratio kick data
+    'token_mapping': {}  # Map token positions to actual tokens if available
+}
+
+def log_token_attention_data(step, token_positions, attention_scores, accumulated_scores, mode='hh_all'):
+    """Log token-wise attention data"""
+    global token_analysis_data
+    
+    if mode == 'hh_all':
+        token_analysis_data['hh_all_data'][step] = {
+            'attention_scores': attention_scores.detach().cpu().numpy() if torch.is_tensor(attention_scores) else attention_scores,
+            'accumulated_scores': accumulated_scores.detach().cpu().numpy() if torch.is_tensor(accumulated_scores) else accumulated_scores,
+            'token_positions': token_positions
+        }
+        
+        logger.info(f"=== Step {step} - HH_ALL Token Analysis ===")
+        logger.info(f"Token positions: {token_positions}")
+        logger.info(f"Current attention scores: {attention_scores[:10] if len(attention_scores) > 10 else attention_scores}")
+        logger.info(f"Accumulated scores: {accumulated_scores[:10] if len(accumulated_scores) > 10 else accumulated_scores}")
+        logger.info("============================================")
+
+def log_kicked_tokens(step, kicked_token_positions, kick_indices, accumulated_scores_before_kick, mode='hh_ratio'):
+    """Log information about kicked tokens"""
+    global token_analysis_data
+    
+    if mode == 'hh_ratio':
+        token_analysis_data['hh_ratio_data'][step] = {
+            'kicked_positions': kicked_token_positions,
+            'kick_indices': kick_indices.detach().cpu().numpy() if torch.is_tensor(kick_indices) else kick_indices,
+            'scores_before_kick': accumulated_scores_before_kick.detach().cpu().numpy() if torch.is_tensor(accumulated_scores_before_kick) else accumulated_scores_before_kick
+        }
+        
+        logger.info(f"=== Step {step} - HH_RATIO Kicked Tokens ===")
+        logger.info(f"Kicked token positions: {kicked_token_positions}")
+        logger.info(f"Kick indices: {kick_indices}")
+        logger.info(f"Scores before kick: {accumulated_scores_before_kick}")
+        logger.info("===========================================")
+
+def save_analysis_summary():
+    """Save comprehensive analysis summary"""
+    logger.info("=== COMPREHENSIVE TOKEN ANALYSIS SUMMARY ===")
+    
+    # Compare hh_all vs hh_ratio data
+    hh_all_steps = set(token_analysis_data['hh_all_data'].keys())
+    hh_ratio_steps = set(token_analysis_data['hh_ratio_data'].keys())
+    common_steps = hh_all_steps.intersection(hh_ratio_steps)
+    
+    logger.info(f"Analysis coverage - HH_ALL steps: {len(hh_all_steps)}, HH_RATIO steps: {len(hh_ratio_steps)}")
+    logger.info(f"Common steps for comparison: {len(common_steps)}")
+    
+    # Find potentially important tokens that were kicked
+    for step in common_steps:
+        hh_all_data = token_analysis_data['hh_all_data'][step]
+        hh_ratio_data = token_analysis_data['hh_ratio_data'][step]
+        
+        # Identify tokens that had high future importance but were kicked
+        if 'kicked_positions' in hh_ratio_data:
+            logger.info(f"Step {step} - Analyzing kicked vs retained tokens")
+            logger.info(f"Kicked positions: {hh_ratio_data['kicked_positions']}")
+            
+    logger.info("=============================================")
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -231,6 +336,8 @@ class TorchDevice:
 
     def del_attention_compute_workspace(self):
         self.attention_compute_workspace = None
+        # Save analysis summary when workspace is deleted
+        save_analysis_summary()
 
     def gen_attention_mask(self, token_ids, pad_token_id, donate):
         data = token_ids.data.ne(pad_token_id)
@@ -527,9 +634,38 @@ class TorchDevice:
             # (s, b * n_head)
             acc.data = acc.data.cuda()
             acc.data[-1] = 0
+            
+            # Log current step attention data for hh_all mode
+            global token_analysis_data
+            current_step = token_analysis_data['step']
+            token_positions = list(range(src_s))
+            
+            # Current attention scores (average across heads for simplicity)
+            current_attention = attn_weights.mean(dim=1).detach().cpu()  # Average across heads
+            
+            # Previous accumulated scores before adding current
+            prev_accumulated = acc.data.mean(dim=1).detach().cpu()  # Average across heads
+            
             acc.data = acc.data + attn_weights
+            
+            # New accumulated scores after adding current
+            new_accumulated = acc.data.mean(dim=1).detach().cpu()  # Average across heads
+            
+            # Log the data
+            log_token_attention_data(
+                step=current_step,
+                token_positions=token_positions,
+                attention_scores=current_attention,
+                accumulated_scores=new_accumulated,
+                mode='hh_all'
+            )
+            
             # print("acc.data", acc.data.shape, acc.data[:, -4])
             kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
+            
+            # Increment step counter
+            token_analysis_data['step'] += 1
+            
             if not k.is_cuda:
                 acc.data = acc.data.float().cpu()
             # kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k + 1, :])
@@ -540,7 +676,33 @@ class TorchDevice:
     def _get_light_hitter(self, acc):
         # return torch.zeros(attn_weights.shape[0])
         if acc.shape[0] > 0:
+            logger.info(f"=== Kick Index Decision Criteria ===")
+            logger.info(f"Accumulated attention weights shape: {acc.shape}")
+            logger.info(f"Min values per head: {acc.min(dim=0).values[:5]}")  # First 5 heads
+            logger.info(f"Max values per head: {acc.max(dim=0).values[:5]}")  # First 5 heads
+            logger.info(f"Mean values per head: {acc.mean(dim=0)[:5]}")       # First 5 heads
+            
             kick_ind = acc.argmin(dim=0).squeeze()
+            logger.info(f"Selected kick indices (argmin): {kick_ind[:10]}")  # First 10 indices
+            
+            # Log kicked token information for hh_ratio mode
+            global token_analysis_data
+            current_step = token_analysis_data['step']
+            
+            # Get positions that will be kicked
+            kicked_positions = kick_ind.detach().cpu().numpy() if torch.is_tensor(kick_ind) else kick_ind
+            accumulated_scores_before_kick = acc.mean(dim=1).detach().cpu()  # Average across heads
+            
+            log_kicked_tokens(
+                step=current_step,
+                kicked_token_positions=kicked_positions,
+                kick_indices=kick_ind,
+                accumulated_scores_before_kick=accumulated_scores_before_kick,
+                mode='hh_ratio'
+            )
+            
+            logger.info(f"====================================")
+            
             # print(kick_ind)
             # fake_ind = torch.randint(low=0, high=acc.shape[0] - 1, size=kick_ind.shape)
             # return fake_ind
@@ -588,6 +750,13 @@ class TorchDevice:
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
         # shape: (b * n_head, 1, s)
         attn_weights = torch.bmm(q, k)
+        
+        # Log attention computation details
+        logger.info(f"=== Attention Weights Computation ===")
+        logger.info(f"Q shape: {q.shape}, K shape: {k.shape}")
+        logger.info(f"Raw attention weights shape: {attn_weights.shape}")
+        logger.info(f"Raw attention weights (first head, first 5): {attn_weights[0].squeeze()[:5]}")
+        
         # print("attn_weights (first bmm)", attn_weights.shape, attn_weights[-1])
         # shape: (b, 1, 1, s)
         mask = mask.view(b, 1, 1, src_s)
@@ -596,8 +765,16 @@ class TorchDevice:
         #attn_weights = torch.where(mask, attn_weights, -1e4)
         attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
+        
+        logger.info(f"Attention weights before softmax (first head, first 5): {attn_weights[0].squeeze()[:5]}")
+        
         # print("attn_weights (before softmax)", attn_weights.shape, attn_weights[-1])
         attn_weights = F.softmax(attn_weights, dim=2, dtype=torch.float32).to(k.dtype)
+        
+        logger.info(f"Attention weights after softmax (first head, first 5): {attn_weights[0].squeeze()[:5]}")
+        logger.info(f"Attention weights sum (should be 1): {attn_weights[0].squeeze().sum()}")
+        logger.info(f"=====================================")
+        
         # print("attn_weights (after softmax)", attn_weights.shape, attn_weights[-4])
         return attn_weights
 
@@ -614,6 +791,35 @@ class TorchDevice:
         topk = int(attn_sparsity * (attn_weights.shape[2] - 1))
         topk_weights, topk_indices = attn_weights[:, :, :-1].topk(
             topk, dim=2, sorted=False)
+        
+        # Log sparse attention selection for hh_ratio mode
+        global token_analysis_data
+        current_step = token_analysis_data['step']
+        
+        # Get selected and kicked token positions
+        all_positions = set(range(src_s - 1))  # Exclude the last (current) token
+        selected_positions = set(topk_indices.view(-1).cpu().numpy())
+        kicked_positions = list(all_positions - selected_positions)
+        
+        # Log the sparse attention selection
+        logger.info(f"=== Step {current_step} - Sparse Attention Selection ===")
+        logger.info(f"Total positions: {src_s-1}, Selected (top-k): {topk}, Kicked: {len(kicked_positions)}")
+        logger.info(f"Selected positions: {sorted(list(selected_positions))[:10]}...")  # First 10
+        logger.info(f"Kicked positions: {sorted(kicked_positions)[:10]}...")  # First 10
+        logger.info("==================================================")
+        
+        # Store sparse attention data
+        log_kicked_tokens(
+            step=current_step,
+            kicked_token_positions=kicked_positions,
+            kick_indices=kicked_positions,
+            accumulated_scores_before_kick=attn_weights.mean(dim=0).squeeze().detach().cpu(),
+            mode='hh_ratio'
+        )
+        
+        # Increment step counter for sparse attention
+        token_analysis_data['step'] += 1
+        
         topk_indices = topk_indices.view(b * n_head, topk).transpose(0, 1)
         # shape: (b * n_head, 1, topk+1)
         attn_weights = torch.cat([topk_weights,
