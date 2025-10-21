@@ -30,6 +30,49 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+class TokenLifetimeTraker:
+    def __init__(self):
+        self.token_lifetimes = {}
+
+    def record_cache_replace(self, step, kick_ind, oldest, hh_k):
+        oldest_absolute_pos = step+oldest
+        if oldest_absolute_pos not in self.token_lifetimes:
+            self.token_lifetimes[oldest_absolute_pos] = {
+                'moved_to_hh_step': step,
+                'kick_step':None
+            }
+
+    def finalize_lifetimes(self, final_step):
+        survivors = []
+        kicked = []
+
+        for token_pos, lifetime in self.token_lifetimes.items():
+            moved_to_hh = lifetime['moved_to_hh_step']
+            kick_step = lifetime['kick_step']
+
+            if moved_to_hh is not None:
+                hh_duration = (kick_step if kick_step else final_step) - moved_to_hh
+                if kick_step is None:
+                    survivors.append(hh_duration)
+                else:
+                    kicked.append(hh_duration)
+        print(f"/\n{'='*50}")
+        print(f"Heavy hitter token lifetime statistics:")
+        print(f"/\n{'='*50}")
+
+        if survivors:
+            avg_survivor = sum(survivors)/len(survivors)
+            print(f"The number of survived tokens: {len(survivors)}")
+            print(f"Average survivor duration: {avg_survivor:.2f} steps")
+
+        if kicked:
+            avg_kicked = sum(kicked)/len(kicked)
+            print(f"The number of kicked from HH tokens: {len(kicked)}")
+            print(f"Average duration before kicked: {avg_kicked:.2f} steps")
+
+tocken_lifetime_traker = TokenLifetimeTraker()
+
+
 
 class DeviceType(Enum):
     CPU = auto()
@@ -598,7 +641,7 @@ class TorchDevice:
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         # print("attn_weights (before softmax)", attn_weights.shape, attn_weights[-1])
         attn_weights = F.softmax(attn_weights, dim=2, dtype=torch.float32).to(k.dtype)
-        # print("attn_weights (after softmax)", attn_weights.shape, attn_weights[-4])
+        #print("attn_weights (after softmax)", attn_weights.shape, attn_weights[-4])
         return attn_weights
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
