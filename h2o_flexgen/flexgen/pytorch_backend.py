@@ -30,6 +30,74 @@ def fix_recursive_import():
     general_copy_compressed = compression.general_copy_compressed
     TorchCompressedDevice = compression.TorchCompressedDevice
 
+class TokenLifetimeTraker:
+    def __init__(self):
+        self.moved_to_hh = {}
+        self.kicked_records = []
+        self.lifetimes = {}
+
+
+    def record_cache_replace(self, step, kick_ind, oldest, hh_k, layer_id):
+        if torch.is_tensor(kick_ind):
+            kick_ind_list = kick_ind.cpu().tolist()
+            for batch_head_ind , token_pos in enumerate(kick_ind_list):
+                self.record_single_replace(step, batch_head_ind, token_pos, layer_id)
+        else:
+            self.record_single_replace(step, 0, kick_ind, layer_id)
+
+
+    def record_single_replace(self, step, batch_head_ind, token_pos, layer_id):
+        key = (layer_id, batch_head_ind, token_pos)
+             
+        if key in self.moved_to_hh:
+            moved_step = self.moved_to_hh[key]
+            if moved_step is not None:
+                lifetime = step - moved_step
+                #if lifetime > 1:
+                self.kicked_records.append(lifetime)
+                if lifetime in self.lifetimes:
+                    self.lifetimes[lifetime] += 1
+                else:
+                    self.lifetimes[lifetime] = 1
+                #if lifetime > 1:
+                #    print(f"{key}th cache kicked out at {step} step, lifetime: {lifetime}")
+
+        self.moved_to_hh[key] = step
+        #if layer_id == 0 and batch_head_ind == 14:
+        #    print(f"{token_pos}th cache moved to HH at {step} step")
+
+    
+
+    def finalize_lifetimes(self, final_step):
+        
+        print(f"\n{'='*50}")
+        print(f"Heavy hitter token lifetime statistics:")
+        # for lifetime in sorted(self.lifetimes.keys()):
+        #     count = self.lifetimes[lifetime]
+        #     print(f"  Lifetime {lifetime}: {count} tokens")
+        #     
+
+        if self.moved_to_hh:
+            survivors = []
+            for (layer_id,batch_head_ind, token_pos), moved_step in self.moved_to_hh.items():
+                if moved_step is not None:
+                    lifetime = final_step - moved_step
+                    survivors.append(lifetime)
+            if survivors:
+                avg_survivor = sum(survivors)/len(survivors)
+                print(f"The number of survived tokens: {len(survivors)}")
+                print(f"Average survivor duration: {avg_survivor:.2f} steps")
+
+        if self.kicked_records:
+            avg_kicked = sum(self.kicked_records)/len(self.kicked_records)
+            print(f"The number of kicked from HH tokens: {len(self.kicked_records)}")
+            print(f"Average duration before kicked: {avg_kicked:.2f} steps")
+
+        print(f"{'='*50}")
+
+token_lifetime_traker = TokenLifetimeTraker()
+
+
 
 class DeviceType(Enum):
     CPU = auto()
@@ -604,7 +672,7 @@ class TorchDevice:
         attn_weights = attn_weights.view(b * n_head, 1, src_s)
         # print("attn_weights (before softmax)", attn_weights.shape, attn_weights[-1])
         attn_weights = F.softmax(attn_weights, dim=2, dtype=torch.float32).to(k.dtype)
-        # print("attn_weights (after softmax)", attn_weights.shape, attn_weights[-4])
+        #print("attn_weights (after softmax)", attn_weights.shape, attn_weights[-4])
         return attn_weights
 
     def _attention_value(self, q, k, v, mask, b, src_s, tgt_s, n_head, head_dim):
