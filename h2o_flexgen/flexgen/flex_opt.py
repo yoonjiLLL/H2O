@@ -20,7 +20,7 @@ from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
 from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import,
-    cache_replace, acc_replace, tocken_lifetime_traker)
+    cache_replace, acc_replace, token_lifetime_traker)
 from flexgen.timer import timers
 from flexgen.utils import (Task, ExecutionEnv, GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -440,7 +440,7 @@ class SelfAttention:
             if self.policy.hh_all:
                 oldest = ((i - 1) % (self.hh_k - 1)) - (self.hh_k - 1)
 
-                tocken_lifetime_traker.record_cache_replace(i, kick_ind, oldest, self.hh_k)
+                token_lifetime_traker.record_cache_replace(i, kick_ind, oldest, self.hh_k, self.layer_id)
                 cache_replace(k_home, kick_ind, k_new, self.hh_k, oldest)
                 cache_replace(v_home, kick_ind, v_new, self.hh_k, oldest)
                 acc_replace(acc, kick_ind, acc_new, self.hh_k, oldest)
@@ -961,7 +961,7 @@ class OptLM:
             raise ValueError("Invalid debug mode: {debug_mode}")
             
         if self.policy.hh_all:
-            token_lifetime_tracker.finalize_lifetimes(self.execute_gen_len -1)
+            token_lifetime_traker.finalize_lifetimes(self.execute_gen_len -1)
 
         # Delete cache
         for j in range(num_layers):

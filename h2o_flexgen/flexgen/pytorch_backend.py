@@ -32,45 +32,70 @@ def fix_recursive_import():
 
 class TokenLifetimeTraker:
     def __init__(self):
-        self.token_lifetimes = {}
+        self.moved_to_hh = {}
+        self.kicked_records = []
+        self.lifetimes = {}
 
-    def record_cache_replace(self, step, kick_ind, oldest, hh_k):
-        oldest_absolute_pos = step+oldest
-        if oldest_absolute_pos not in self.token_lifetimes:
-            self.token_lifetimes[oldest_absolute_pos] = {
-                'moved_to_hh_step': step,
-                'kick_step':None
-            }
+
+    def record_cache_replace(self, step, kick_ind, oldest, hh_k, layer_id):
+        if torch.is_tensor(kick_ind):
+            kick_ind_list = kick_ind.cpu().tolist()
+            for batch_head_ind , token_pos in enumerate(kick_ind_list):
+                self.record_single_replace(step, batch_head_ind, token_pos, layer_id)
+        else:
+            self.record_single_replace(step, 0, kick_ind, layer_id)
+
+
+    def record_single_replace(self, step, batch_head_ind, token_pos, layer_id):
+        key = (layer_id, batch_head_ind, token_pos)
+             
+        if key in self.moved_to_hh:
+            moved_step = self.moved_to_hh[key]
+            if moved_step is not None:
+                lifetime = step - moved_step
+                #if lifetime > 1:
+                self.kicked_records.append(lifetime)
+                if lifetime in self.lifetimes:
+                    self.lifetimes[lifetime] += 1
+                else:
+                    self.lifetimes[lifetime] = 1
+                #if lifetime > 1:
+                #    print(f"{key}th cache kicked out at {step} step, lifetime: {lifetime}")
+
+        self.moved_to_hh[key] = step
+        #if layer_id == 0 and batch_head_ind == 14:
+        #    print(f"{token_pos}th cache moved to HH at {step} step")
+
+    
 
     def finalize_lifetimes(self, final_step):
-        survivors = []
-        kicked = []
-
-        for token_pos, lifetime in self.token_lifetimes.items():
-            moved_to_hh = lifetime['moved_to_hh_step']
-            kick_step = lifetime['kick_step']
-
-            if moved_to_hh is not None:
-                hh_duration = (kick_step if kick_step else final_step) - moved_to_hh
-                if kick_step is None:
-                    survivors.append(hh_duration)
-                else:
-                    kicked.append(hh_duration)
-        print(f"/\n{'='*50}")
+        
+        print(f"\n{'='*50}")
         print(f"Heavy hitter token lifetime statistics:")
-        print(f"/\n{'='*50}")
+        # for lifetime in sorted(self.lifetimes.keys()):
+        #     count = self.lifetimes[lifetime]
+        #     print(f"  Lifetime {lifetime}: {count} tokens")
+        #     
 
-        if survivors:
-            avg_survivor = sum(survivors)/len(survivors)
-            print(f"The number of survived tokens: {len(survivors)}")
-            print(f"Average survivor duration: {avg_survivor:.2f} steps")
+        if self.moved_to_hh:
+            survivors = []
+            for (layer_id,batch_head_ind, token_pos), moved_step in self.moved_to_hh.items():
+                if moved_step is not None:
+                    lifetime = final_step - moved_step
+                    survivors.append(lifetime)
+            if survivors:
+                avg_survivor = sum(survivors)/len(survivors)
+                print(f"The number of survived tokens: {len(survivors)}")
+                print(f"Average survivor duration: {avg_survivor:.2f} steps")
 
-        if kicked:
-            avg_kicked = sum(kicked)/len(kicked)
-            print(f"The number of kicked from HH tokens: {len(kicked)}")
+        if self.kicked_records:
+            avg_kicked = sum(self.kicked_records)/len(self.kicked_records)
+            print(f"The number of kicked from HH tokens: {len(self.kicked_records)}")
             print(f"Average duration before kicked: {avg_kicked:.2f} steps")
 
-tocken_lifetime_traker = TokenLifetimeTraker()
+        print(f"{'='*50}")
+
+token_lifetime_traker = TokenLifetimeTraker()
 
 
 
