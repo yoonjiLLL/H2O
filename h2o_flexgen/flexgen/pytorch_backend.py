@@ -398,7 +398,7 @@ class TorchDevice:
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, acc, donate,
                 attn_sparsity, compress_cache, comp_config,
-                hh_k=None, hh_all=False):
+                hh_k=None, hh_all=False, newpolicy1=False): #added for newpolicy1
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -527,9 +527,15 @@ class TorchDevice:
             # (s, b * n_head)
             acc.data = acc.data.cuda()
             acc.data[-1] = 0
-            acc.data = acc.data + attn_weights
+            #acc.data = acc.data + attn_weights
             # print("acc.data", acc.data.shape, acc.data[:, -4])
-            kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
+            if newpolicy1: # added for newpolicy1
+                combined_score = newpolicy1 * acc.data + (1 - newpolicy1) * attn_weights
+                kick_ind = combined_score[:src_s - hh_k, :].argmin(dim=0).squeeze()
+                acc.data = acc.data + attn_weights
+            else:
+                acc.data = acc.data + attn_weights
+                kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
             if not k.is_cuda:
                 acc.data = acc.data.float().cpu()
             # kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k + 1, :])

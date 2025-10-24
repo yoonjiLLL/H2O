@@ -72,6 +72,7 @@ class Policy:
     hh_ratio: float = 1
     hh_all: bool = False
     hh_long_seq: bool = False
+    newpolicy1: bool = False # balancing acc and current score added for newpolicy1
 
     @property
     def w_disk_percent(self):
@@ -502,7 +503,7 @@ class SelfAttention:
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, acc, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
-                self.hh_k, self.policy.hh_all)
+                self.hh_k, self.policy.hh_all, self.policy.newpolicy1) #added for newpolicy1
             # if self.layer_id == 10:
             #     print(h.data)
             cache_write_buf.store((new_k_cache, new_v_cache, acc, kick_ind))
@@ -1294,7 +1295,8 @@ def run_flexgen(args):
                                       group_dim=2, symmetric=False),
                     hh_ratio=args.hh_ratio,
                     hh_all=args.hh_all,
-                    hh_long_seq=args.hh_long_seq)
+                    hh_long_seq=args.hh_long_seq,
+                    newpolicy1 =args.newpolicy1) #added for newpolicy1
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
@@ -1410,6 +1412,8 @@ def add_parser_arguments(parser):
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
         const=True, default=True)
+    parser.add_argument("--newpolicy1", type=float, default=False,
+        help="Whether to use new policy 1.") #added for newpolicy1
 
 
 if __name__ == "__main__":
