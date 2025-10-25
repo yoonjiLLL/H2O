@@ -51,7 +51,36 @@ def local_heavy_hitter_mask(attn_weights, heavy_budget):
         accumulated_attention_score = accumulated_attention_score * mask_bottom_index
 
     return mask_bottom
+def newpolicy1_heavy_hitter_mask(attn_weights, heavy_budget, beta):
+    
+    # attn_weights (BS, head, query, keys)
+    dtype_attn_weights = attn_weights.dtype
+    seq_length = attn_weights.shape[-1]
+    padding_length = 0
 
+    offset = torch.finfo(attn_weights.dtype).min
+    tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(dtype_attn_weights)
+
+    accumulated_attention_score = torch.sum(tmp_attn[:,:,padding_length:heavy_budget+padding_length,:], dim=-2) #(head, keys)
+    accumulated_attention_score[:,:,heavy_budget+padding_length:] = 0
+    accumulated_attention_score[:,:,:padding_length] = 0
+
+    mask_bottom = torch.zeros_like(attn_weights, dtype=torch.bool)
+    mask_bottom[:,:, padding_length:heavy_budget+padding_length, padding_length:heavy_budget+padding_length] = True
+
+    for token_index in range(heavy_budget+padding_length, seq_length):
+
+        tmp_attn_index = nn.functional.softmax(attn_weights[:,:,token_index,:], dim=-1, dtype=torch.float32).to(dtype_attn_weights)
+        _, tmp_topk_index = accumulated_attention_score.topk(k=heavy_budget-1, dim=-1)
+        zeros_index = torch.zeros_like(tmp_attn_index, dtype=torch.bool)
+        mask_bottom_index = zeros_index.scatter(-1, tmp_topk_index, True) #(head, keys)
+        mask_bottom_index[:,:, token_index] = True
+
+        mask_bottom[:,:,token_index,:] = mask_bottom_index
+        final_score = beta * accumulated_attention_score + (1-beta)* tmp_attn_index
+        accumulated_attention_score = final_score * mask_bottom_index
+
+    return mask_bottom
 
 class LlamaAttention_heavy_hitter(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -78,6 +107,9 @@ class LlamaAttention_heavy_hitter(nn.Module):
         self.heavy_budget_ratio = config.heavy_ratio
         self.recent_budget_ratio = config.recent_ratio
 
+        self.policy_name = getattr(config, "policy_name", "h2o_global")
+        self.newpolicy1 = getattr(config, "newpolicy1", 0.9)
+
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -87,6 +119,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
@@ -98,16 +131,29 @@ class LlamaAttention_heavy_hitter(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+        past_key_to_cat = None
+        past_value_to_cat = None
         if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            if isinstance(past_key_value, tuple) and len(past_key_value) == 2:
+                past_key_to_cat = past_key_value[0]
+                past_value_to_cat = past_key_value[1]
+                if torch.is_tensor(past_key_to_cat):
+                    kv_seq_len += past_key_to_cat.shape[-2]
+            else:
+                print(f"Unexpected past_key_value: {type(past_key_value)}")
+                pass
+            
+        cos, sin = self.rotary_emb(value_states)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # [bsz, nh, t, hd]
+        if past_key_to_cat is not None and past_value_to_cat is not None:
+            key_states = torch.cat([past_key_to_cat, key_states], dim=2)
+            value_states = torch.cat([past_value_to_cat, value_states], dim=2)
 
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # if past_key_value is not None:
+        #     # reuse k, v, self_attention
+        #     key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        #     value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         past_key_value = (key_states, value_states) if use_cache else None
 
@@ -150,18 +196,29 @@ class LlamaAttention_heavy_hitter(nn.Module):
 
         
         # Heavy Hitter Mask (Based on global statistics)
-        tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
-        tmp_sum = torch.sum(tmp_attn, dim=-2) 
-        _, tmp_topk = tmp_sum.topk(k=heavy_budget, dim=-1)
+        if self.policy_name == "h2o_global":
+            tmp_attn = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
+            tmp_sum = torch.sum(tmp_attn, dim=-2) 
+            _, tmp_topk = tmp_sum.topk(k=heavy_budget, dim=-1)
 
-        zeros = torch.zeros_like(tmp_sum, dtype=torch.bool)
-        mask_bottom = zeros.scatter(-1, tmp_topk, True).unsqueeze(2)
-        mask_bottom = mask_bottom.expand(mask_bottom.shape[0], mask_bottom.shape[1], attn_weights.shape[-2], mask_bottom.shape[-1])
-
+            zeros = torch.zeros_like(tmp_sum, dtype=torch.bool)
+            mask_bottom = zeros.scatter(-1, tmp_topk, True).unsqueeze(2)
+            mask_bottom = mask_bottom.expand(mask_bottom.shape[0], mask_bottom.shape[1], attn_weights.shape[-2], mask_bottom.shape[-1])
+        elif self.policy_name == "h2o_newpolicy1":
+            mask_bottom = newpolicy1_heavy_hitter_mask(attn_weights, heavy_budget, self.newpolicy1)
+        
         ones = torch.ones_like(attn_weights, dtype=torch.bool)
-        ones = torch.tril(ones, diagonal=recent_budget)
         ones = torch.triu(ones, diagonal=-recent_budget)
-        mask_bottom = torch.logical_or(mask_bottom, ones)
+
+        if self.policy_name == "h2o_global":
+            ones = torch.tril(ones, diagonal=recent_budget)
+            mask_bottom = torch.logical_or(mask_bottom, ones)
+
+        elif self.policy_name == "h2o_newpolicy1":
+            ones = torch.tril(ones, diagonal=recent_budget)
+            mask_bottom = torch.logical_or(mask_bottom, ones)
+
+
         # mask_bottom = ones
         attn_weights[~mask_bottom] = torch.finfo(attn_weights.dtype).min
 
@@ -185,6 +242,11 @@ class LlamaAttention_heavy_hitter(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+
+
+
+
 
 
 def convert_kvcache_llama_heavy_recent(model, config):
